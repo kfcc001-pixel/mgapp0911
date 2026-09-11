@@ -1,202 +1,214 @@
-"""Supabase INSERT/UPDATE 알림을 Gmail로 전송하는 FastAPI 앱.
+"""Single-file Streamlit Supabase CRUD dashboard with Gmail notifications.
 
-설치:
-    pip install fastapi==0.116.1 uvicorn[standard]==0.35.0 \
-        google-api-python-client==2.179.0 google-auth==2.40.3 \
-        google-auth-oauthlib==1.2.2
+Install:
+  pip install streamlit==1.49.1 requests==2.32.5 pandas==2.3.2 google-api-python-client==2.179.0 google-auth==2.40.3
+Run: streamlit run app.py
 
-환경변수:
-    WEBHOOK_SECRET       Supabase Webhook의 Authorization 헤더와 맞출 긴 임의 문자열
-    GMAIL_TO             수신 이메일 주소(쉼표로 여러 개 지정 가능)
-    GOOGLE_TOKEN_JSON    Gmail OAuth token.json 전체 내용을 JSON 문자열로 저장
-    ALLOWED_TABLES       선택 사항. 허용할 테이블명(쉼표 구분); 비우면 모든 테이블
-    REDACT_FIELDS        선택 사항. 마스킹할 컬럼명(쉼표 구분)
-
-최초 OAuth 토큰 생성:
-    1. Google Cloud에서 Gmail API를 켜고 OAuth 데스크톱 앱 credentials.json을 받습니다.
-    2. python app.py --authorize credentials.json
-    3. 출력된 JSON 전체를 배포 환경의 GOOGLE_TOKEN_JSON Secret으로 등록합니다.
-
-실행:
-    uvicorn app:app --host 0.0.0.0 --port 8000
-
-Supabase Dashboard > Database > Webhooks에서 INSERT와 UPDATE를 선택하고:
-    URL: https://<배포주소>/supabase-webhook
-    Header: Authorization = Bearer <WEBHOOK_SECRET 값>
+Streamlit Secrets: GMAIL_TO and GOOGLE_TOKEN_JSON.
 """
-
 from __future__ import annotations
-
-import argparse
 import base64
-import hashlib
-import hmac
 import json
-import logging
-import os
-import sys
-import time
 from email.message import EmailMessage
-from html import escape
 from typing import Any
+from urllib.parse import quote
 
-from fastapi import FastAPI, Header, HTTPException, Request
+import pandas as pd
+import requests
+import streamlit as st
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
-from pydantic import BaseModel, ConfigDict
 
+DEFAULT_URL = "https://nxjqmfooxmyqufkzgpre.supabase.co"
+DEFAULT_KEY = "sb_publishable_8pM7FWQIBXFKLHWj0xBKlQ_it3zttv_"
 SCOPES = ["https://www.googleapis.com/auth/gmail.send"]
-DEFAULT_REDACT_FIELDS = {
-    "password", "passwd", "secret", "token", "access_token", "refresh_token",
-    "authorization", "api_key", "apikey", "ssn", "resident_number",
-    "주민등록번호", "계좌비밀번호",
-}
-
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
-logger = logging.getLogger("supabase-gmail-webhook")
-app = FastAPI(title="Supabase Gmail Notifier", docs_url=None, redoc_url=None)
+MASK_FIELDS = {"password", "passwd", "secret", "token", "access_token",
+               "refresh_token", "authorization", "api_key", "apikey",
+               "ssn", "resident_number", "주민등록번호", "계좌비밀번호"}
+st.set_page_config(page_title="Supabase CRUD", page_icon="🗄️", layout="wide")
 
 
-class WebhookPayload(BaseModel):
-    model_config = ConfigDict(extra="allow")
-    type: str
-    table: str
-    schema_name: str | None = None
-    record: dict[str, Any] | None = None
-    old_record: dict[str, Any] | None = None
+def setting(name: str, default: str = "") -> str:
+    try:
+        return str(st.secrets.get(name, default)).strip()
+    except Exception:
+        return default
 
 
-def required_env(name: str) -> str:
-    value = os.getenv(name, "").strip()
-    if not value:
-        raise RuntimeError(f"필수 환경변수 {name}이(가) 없습니다.")
+URL = setting("SUPABASE_URL", DEFAULT_URL).rstrip("/")
+KEY = setting("SUPABASE_KEY", DEFAULT_KEY)
+
+
+def headers(prefer: str | None = None) -> dict[str, str]:
+    value = {"apikey": KEY, "Authorization": f"Bearer {KEY}",
+             "Content-Type": "application/json"}
+    if prefer:
+        value["Prefer"] = prefer
     return value
 
 
-def csv_env(name: str) -> set[str]:
-    return {v.strip() for v in os.getenv(name, "").split(",") if v.strip()}
+def check(response: requests.Response) -> Any:
+    if not response.ok:
+        try:
+            detail = response.json()
+        except ValueError:
+            detail = response.text
+        raise RuntimeError(f"Supabase 오류 ({response.status_code}): {detail}")
+    return response.json() if response.content else None
 
 
-def mask_rows(value: Any, redacted: set[str]) -> Any:
+@st.cache_data(ttl=300, show_spinner=False)
+def schema_spec(url: str, key: str) -> dict[str, Any]:
+    return check(requests.get(f"{url}/rest/v1/",
+        headers={"apikey": key, "Authorization": f"Bearer {key}"}, timeout=15))
+
+
+def rows(table: str, limit: int) -> list[dict[str, Any]]:
+    return check(requests.get(f"{URL}/rest/v1/{quote(table, safe='')}",
+        headers=headers(), params={"select": "*", "limit": limit}, timeout=30))
+
+
+def mutate(method: str, table: str, data=None, params=None) -> list[dict[str, Any]]:
+    response = requests.request(method, f"{URL}/rest/v1/{quote(table, safe='')}",
+        headers=headers("return=representation"), json=data, params=params, timeout=30)
+    return check(response) or []
+
+
+def mask(value: Any) -> Any:
     if isinstance(value, dict):
-        return {
-            key: "***REDACTED***" if key.lower() in redacted else mask_rows(item, redacted)
-            for key, item in value.items()
-        }
+        return {k: "***REDACTED***" if k.lower() in MASK_FIELDS else mask(v)
+                for k, v in value.items()}
     if isinstance(value, list):
-        return [mask_rows(item, redacted) for item in value]
+        return [mask(v) for v in value]
     return value
 
 
-def gmail_credentials() -> Credentials:
+def notify(event: str, table: str, before: Any, after: Any) -> None:
+    recipient, token = setting("GMAIL_TO"), setting("GOOGLE_TOKEN_JSON")
+    if not recipient or not token:
+        st.warning("DB 작업은 완료됐지만 Gmail Secrets가 없어 메일은 보내지 않았습니다.")
+        return
     try:
-        info = json.loads(required_env("GOOGLE_TOKEN_JSON"))
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("GOOGLE_TOKEN_JSON이 올바른 JSON이 아닙니다.") from exc
-    creds = Credentials.from_authorized_user_info(info, SCOPES)
-    if creds.expired and creds.refresh_token:
-        creds.refresh(GoogleAuthRequest())
-    if not creds.valid:
-        raise RuntimeError("Gmail OAuth 토큰이 유효하지 않습니다. 다시 인증하세요.")
-    return creds
-
-
-def email_content(payload: WebhookPayload) -> tuple[str, str, str]:
-    event = payload.type.upper()
-    redacted = {x.lower() for x in DEFAULT_REDACT_FIELDS | csv_env("REDACT_FIELDS")}
-    before = mask_rows(payload.old_record, redacted)
-    after = mask_rows(payload.record, redacted)
-    occurred_at = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
-    subject = f"[Supabase {event}] {payload.table} 테이블 변경 알림"
-    text = (
-        f"Supabase 데이터 변경이 감지되었습니다.\n\n"
-        f"이벤트: {event}\n스키마: {payload.schema_name or 'public'}\n"
-        f"테이블: {payload.table}\n수신 시각: {occurred_at}\n\n"
-        f"변경 전:\n{json.dumps(before, ensure_ascii=False, indent=2, default=str)}\n\n"
-        f"변경 후:\n{json.dumps(after, ensure_ascii=False, indent=2, default=str)}"
-    )
-    html = f"""
-    <h2>Supabase 데이터 변경 알림</h2>
-    <table cellpadding="6" cellspacing="0" border="1" style="border-collapse:collapse">
-      <tr><th>이벤트</th><td>{escape(event)}</td></tr>
-      <tr><th>스키마</th><td>{escape(payload.schema_name or 'public')}</td></tr>
-      <tr><th>테이블</th><td>{escape(payload.table)}</td></tr>
-      <tr><th>수신 시각</th><td>{escape(occurred_at)}</td></tr>
-    </table>
-    <h3>변경 전</h3><pre>{escape(json.dumps(before, ensure_ascii=False, indent=2, default=str))}</pre>
-    <h3>변경 후</h3><pre>{escape(json.dumps(after, ensure_ascii=False, indent=2, default=str))}</pre>
-    """
-    return subject, text, html
-
-
-def send_gmail(subject: str, text: str, html: str) -> str:
-    recipients = [x.strip() for x in required_env("GMAIL_TO").split(",") if x.strip()]
-    message = EmailMessage()
-    message["To"] = ", ".join(recipients)
-    message["Subject"] = subject
-    message.set_content(text)
-    message.add_alternative(html, subtype="html")
-    raw = base64.urlsafe_b64encode(message.as_bytes()).decode("ascii")
-    service = build("gmail", "v1", credentials=gmail_credentials(), cache_discovery=False)
-    result = service.users().messages().send(userId="me", body={"raw": raw}).execute()
-    return str(result["id"])
-
-
-@app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
-
-
-@app.post("/supabase-webhook")
-async def supabase_webhook(
-    request: Request,
-    authorization: str | None = Header(default=None),
-) -> dict[str, str]:
-    expected = f"Bearer {required_env('WEBHOOK_SECRET')}"
-    if not authorization or not hmac.compare_digest(authorization, expected):
-        raise HTTPException(status_code=401, detail="Invalid webhook secret")
-
-    raw = await request.body()
-    try:
-        data = json.loads(raw)
-        # Supabase payload uses the key `schema`; avoid shadowing Pydantic internals.
-        if "schema" in data:
-            data["schema_name"] = data.pop("schema")
-        payload = WebhookPayload.model_validate(data)
-    except (json.JSONDecodeError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail="Invalid webhook payload") from exc
-
-    event = payload.type.upper()
-    if event not in {"INSERT", "UPDATE"}:
-        raise HTTPException(status_code=422, detail="Only INSERT and UPDATE are accepted")
-    allowed = csv_env("ALLOWED_TABLES")
-    if allowed and payload.table not in allowed:
-        raise HTTPException(status_code=403, detail="Table is not allowed")
-
-    # 요청 본문 해시는 문제 추적용이며 원문 데이터는 로그에 남기지 않습니다.
-    event_hash = hashlib.sha256(raw).hexdigest()[:12]
-    try:
-        message_id = send_gmail(*email_content(payload))
+        creds = Credentials.from_authorized_user_info(json.loads(token), SCOPES)
+        if creds.expired and creds.refresh_token:
+            creds.refresh(GoogleAuthRequest())
+        if not creds.valid:
+            raise RuntimeError("Gmail OAuth 토큰이 유효하지 않습니다.")
+        message = EmailMessage()
+        message["To"] = recipient
+        message["Subject"] = f"[Supabase {event}] {table} 변경 알림"
+        message.set_content(
+            f"작업: {event}\n테이블: {table}\n\n변경 전:\n"
+            f"{json.dumps(mask(before), ensure_ascii=False, indent=2, default=str)}\n\n"
+            f"변경 후:\n{json.dumps(mask(after), ensure_ascii=False, indent=2, default=str)}")
+        raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
+        service = build("gmail", "v1", credentials=creds, cache_discovery=False)
+        result = service.users().messages().send(userId="me", body={"raw": raw}).execute()
+        st.success(f"Gmail 발송 완료 (ID: {result['id']})")
     except Exception as exc:
-        logger.exception("메일 발송 실패 event=%s", event_hash)
-        raise HTTPException(status_code=502, detail="Gmail delivery failed") from exc
-    logger.info("메일 발송 성공 event=%s gmail_message_id=%s", event_hash, message_id)
-    return {"status": "sent", "message_id": message_id}
+        st.warning(f"DB 작업은 완료됐지만 Gmail 발송에 실패했습니다: {exc}")
 
 
-def authorize(credentials_path: str) -> None:
-    flow = InstalledAppFlow.from_client_secrets_file(credentials_path, SCOPES)
-    creds = flow.run_local_server(port=0)
-    print(creds.to_json())
+def object_json(raw: str) -> dict[str, Any]:
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise ValueError('JSON 객체여야 합니다. 예: {"name": "홍길동"}')
+    return value
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--authorize", metavar="CREDENTIALS_JSON")
-    args = parser.parse_args()
-    if args.authorize:
-        authorize(args.authorize)
+st.title("Supabase CRUD 대시보드")
+st.caption("설정된 Supabase 프로젝트에 자동 연결됩니다. URL이나 키를 입력할 필요가 없습니다.")
+try:
+    spec = schema_spec(URL, KEY)
+    tables = sorted(spec.get("definitions", {}).keys())
+except Exception as exc:
+    st.error(f"Supabase 연결 실패: {exc}")
+    st.stop()
+if not tables:
+    st.warning("현재 publishable key와 RLS 정책으로 조회 가능한 테이블이 없습니다.")
+    st.stop()
+
+c1, c2 = st.columns([3, 1])
+table = c1.selectbox("테이블", tables)
+limit = c2.number_input("최대 조회 건수", 1, 10000, 100, 50)
+columns = list(spec.get("definitions", {}).get(table, {}).get("properties", {}).keys())
+try:
+    current = rows(table, int(limit))
+    frame = pd.DataFrame(current)
+except Exception as exc:
+    st.error(str(exc))
+    current, frame = [], pd.DataFrame()
+
+m1, m2, m3 = st.columns(3)
+m1.metric("조회 행", len(frame))
+m2.metric("컬럼", len(frame.columns) if not frame.empty else len(columns))
+m3.metric("Gmail", "설정됨" if setting("GMAIL_TO") and setting("GOOGLE_TOKEN_JSON") else "미설정")
+st.dataframe(frame, use_container_width=True, hide_index=True)
+if st.button("새로고침", use_container_width=True):
+    st.cache_data.clear()
+    st.rerun()
+
+available = list(frame.columns) if not frame.empty else columns
+insert_tab, update_tab, delete_tab = st.tabs(["등록 (INSERT)", "수정 (UPDATE)", "삭제 (DELETE)"])
+
+with insert_tab:
+    raw = st.text_area("등록 데이터(JSON)", "{}", height=160, key="insert")
+    if st.button("데이터 등록", type="primary", use_container_width=True):
+        try:
+            result = mutate("POST", table, object_json(raw))
+            st.success(f"{len(result)}건을 등록했습니다.")
+            st.json(result)
+            notify("INSERT", table, None, result)
+            st.cache_data.clear()
+        except Exception as exc:
+            st.error(str(exc))
+
+with update_tab:
+    if available:
+        key_col = st.selectbox("조건 컬럼", available, key="uk")
+        key_val = st.text_input("조건 값", key="uv", placeholder="예: 55")
+        raw = st.text_area("수정 데이터(JSON)", "{}", height=140, key="update")
+        st.caption("조건과 일치하는 모든 행이 수정됩니다.")
+        if st.button("데이터 수정", type="primary", use_container_width=True):
+            try:
+                if not key_val:
+                    raise ValueError("조건 값을 입력하세요.")
+                before = [r for r in current if str(r.get(key_col)) == key_val]
+                result = mutate("PATCH", table, object_json(raw), {key_col: f"eq.{key_val}"})
+                st.success(f"{len(result)}건을 수정했습니다.")
+                st.json(result)
+                notify("UPDATE", table, before, result)
+                st.cache_data.clear()
+            except Exception as exc:
+                st.error(str(exc))
     else:
-        print("서버 실행: uvicorn app:app --host 0.0.0.0 --port 8000", file=sys.stderr)
+        st.info("수정 가능한 컬럼이 없습니다.")
+
+with delete_tab:
+    if available:
+        key_col = st.selectbox("조건 컬럼", available, key="dk")
+        key_val = st.text_input("조건 값", key="dv", placeholder="예: 55")
+        confirm = st.text_input("삭제 확인", key="dc", placeholder="DELETE 입력")
+        st.warning("조건과 일치하는 모든 행이 삭제되며 되돌릴 수 없습니다.")
+        if st.button("데이터 삭제", type="primary", use_container_width=True):
+            try:
+                if not key_val or confirm != "DELETE":
+                    raise ValueError("조건 값을 입력하고 DELETE로 확인하세요.")
+                result = mutate("DELETE", table, params={key_col: f"eq.{key_val}"})
+                st.success(f"{len(result)}건을 삭제했습니다.")
+                st.json(result)
+                notify("DELETE", table, result, None)
+                st.cache_data.clear()
+            except Exception as exc:
+                st.error(str(exc))
+    else:
+        st.info("삭제 조건으로 사용할 컬럼이 없습니다.")
+
+with st.expander("운영 및 보안 안내"):
+    st.markdown("""
+- 내장된 키는 공개용 publishable key이며 실제 CRUD 범위는 Supabase RLS 정책을 따릅니다.
+- service-role key는 코드에 넣지 마세요.
+- Gmail은 이 화면에서 성공한 CRUD 작업에 대해 발송됩니다.
+- 다른 프로그램의 DB 변경까지 상시 감지하려면 별도의 Database Webhook 서버가 필요합니다.
+""")
