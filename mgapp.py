@@ -10,15 +10,8 @@ import streamlit as st
 st.set_page_config(page_title="Supabase 데이터 대시보드", page_icon="🗃️", layout="wide")
 
 
-def get_secret(name: str) -> str:
-    """Reads Streamlit Cloud Secrets without a repository config file."""
-    try:
-        return str(st.secrets[name])
-    except (KeyError, FileNotFoundError):
-        st.error("Supabase 연결 정보가 없습니다.")
-        st.info("Streamlit Cloud → App settings → Secrets에 SUPABASE_URL과 SUPABASE_KEY를 추가하세요.")
-        st.code('SUPABASE_URL = "https://your-project.supabase.co"\nSUPABASE_KEY = "sb_publishable_..."', language="toml")
-        st.stop()
+SUPABASE_URL = "https://nxjqmfooxmyqufkzgpre.supabase.co"
+SUPABASE_KEY = "sb_publishable_8pM7FWQIBXFKLHWj0xBKlQ_it3zttv_"
 
 
 def rest_request(url: str, key: str, table: str, method: str = "GET", query: dict | None = None, body: dict | None = None) -> list[dict[str, Any]]:
@@ -67,12 +60,12 @@ def is_number(value: Any) -> bool:
 
 st.title("🗃️ Supabase 데이터 대시보드")
 st.caption("선택 테이블을 전체 조회해 분석하고, RLS 권한 범위에서 CRUD 작업을 실행합니다.")
-url, key = get_secret("SUPABASE_URL"), get_secret("SUPABASE_KEY")
+url, key = SUPABASE_URL, SUPABASE_KEY
 
 with st.sidebar:
     st.header("조회 설정")
     table = st.text_input("테이블명", value="bank_rates", help="public 스키마의 테이블명을 입력하세요.")
-    st.warning("service_role 키는 사용하지 마세요. publishable/anon 키와 적절한 RLS 정책을 사용해야 합니다.")
+    st.warning("publishable 키가 코드에 포함되어 있습니다. RLS 정책이 데이터 접근 범위를 반드시 제한해야 합니다.")
 
 if not table.strip():
     st.info("왼쪽에서 테이블명을 입력하세요.")
